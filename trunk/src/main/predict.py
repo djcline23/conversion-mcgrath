@@ -9,19 +9,27 @@ import csv
 import scipy.stats
 from collections import defaultdict
 
+#Original format (true) or format for table (false)
 OLD_PRINT = False
+
+#Whether to include chromosomes which contain a het region
+NO_HET = True
 
 class Region:
 	prevPred = "-"
 	nextPred = "-"
 	
-	def __init__(self, strain, chrome, start, earlyEnd, lateEnd, pred, sites):
+	def __init__(self, strain, chrome, prevRegion, start, earlyEnd, lateEnd, pred, sites):
 		self.strain = strain
 		self.chrome = chrome
 		self.start = start
 		self.earlyEnd = earlyEnd
 		self.lateEnd = lateEnd
 		self.pred = pred
+		
+		if(prevRegion):
+			prevRegion.nextPred = pred
+			self.prevPred = prevRegion.pred
 		
 		#Calculate summary stats
 		self.size = (earlyEnd - start) / 1000
@@ -156,6 +164,10 @@ def predictChrome(strain, chrome, sites, binSize, thresholds, predFile):
 	currPred = None
 	currStart = 0
 	currEnd = binSize
+	regions = []
+	
+	#If we find a het region, toss the whole chromosome
+	foundHet = False
 
 	#Keep track of where the last cut point was to make summary stats when
 	#we close the current prediction
@@ -168,6 +180,10 @@ def predictChrome(strain, chrome, sites, binSize, thresholds, predFile):
 		window = sites[currStart:currEnd]
 
 		newPred, halfCall = call(window, thresholds, currPred)
+		
+		if(NO_HET and newPred == 'H'):
+			foundHet = True
+			break
 
 		if currPred and currPred != newPred:
 			#Then we have had a transition
@@ -181,35 +197,34 @@ def predictChrome(strain, chrome, sites, binSize, thresholds, predFile):
 
 			currStart = currStart + cut
 
-			region = Region(strain, chrome, getStart(lastCut, sites), sites[currStart - 1][1], sites[currStart][1], currPred, sites[lastCut:currStart - 1])
-			processNewRegion(predFile, prevRegion, region)
+			currRegion = Region(strain, chrome, prevRegion, getStart(lastCut, sites), sites[currStart - 1][1], sites[currStart][1], currPred, sites[lastCut:currStart - 1])
+			regions.append(currRegion)
 
 			lastCut = currStart
-			prevRegion = region
+			prevRegion = currRegion
 
 		currPred = newPred
 
 		#Not considering overlapping windows, not sure if that's the right thing to do or not
 		#sometimes we only call half of the window length, in which case only
 		#advance half a window size
-		if(halfCall):
-			currEnd = currEnd - binSize / 2
+		
+		#Well let's just always say half a window size to be consistent. -djc 5/22/14
+		#if(halfCall):
+		currEnd = currEnd - binSize / 2
 
 		currStart = findNextDiff(sites, currEnd+1, currPred)
 		currEnd = currStart + binSize
 
-	#Now we are at the end, print the last prediction
-	region = Region(strain, chrome, getStart(lastCut, sites), sites[-1][1], sites[-1][1], currPred, sites[lastCut:currStart - 1])
-	processNewRegion(predFile, prevRegion, region)
-	predFile.write(region.toString() + '\n')
-
-def processNewRegion(outfile, prevRegion, newRegion):
-	"""Sets previous/next prediction for the two regions and prints the previous region"""
-	if(prevRegion):
-		prevRegion.nextPred = newRegion.pred
-		newRegion.prevPred = prevRegion.pred
+	if(NO_HET and foundHet):
+		print "Heterozygous region on {} chromosome {}, ignoring entire chromosome.".format(strain, chrome)
+	else:
+		#Now we are at the end, add the last prediction
+		regions.append(Region(strain, chrome, prevRegion, getStart(lastCut, sites), sites[-1][1], sites[-1][1], currPred, sites[lastCut:currStart - 1]))
 		
-		outfile.write(prevRegion.toString() + '\n')
+		for region in regions:
+			predFile.write(region.toString() + '\n')
+	
 
 def getStart(lastCut, sites):
 	"""Gets the start of a region based on the last cutting point"""
@@ -240,7 +255,7 @@ def findBestCut(sequence, oldPred, newPred):
 		if wrong < bestWrong:
 			bestCut = i
 			bestWrong = wrong
-
+			
 	return bestCut
 
 def callWrong(sequence, pred):
