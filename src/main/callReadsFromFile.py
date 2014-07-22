@@ -63,7 +63,7 @@ def callReads(cutoffs, mutationsFileName, pileupFileName, outFileName):
           p = len(reads) - n - m
           currPileLine = next(pileReader, None)
       
-        site = call(n, m. cutoffs)
+        site = call(n, m, cutoffs)
 
     outFile.write('\t'.join((siteChrom, sitePos, site, str(n), str(m), str(p))) + '\n')
 
