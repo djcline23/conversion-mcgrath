@@ -4,16 +4,24 @@
 djc 3/31/14                                                                         
 '''
 
-import sys
+import math
+import argparse
 import csv
-import scipy.stats
+import util
 from collections import defaultdict
 
-#Original format (true) or format for table (false)
-OLD_PRINT = False
+#Table format (true) or gff format (false)
+TABLE_PRINT = False
 
-#Whether to include chromosomes which contain a het region
-NO_HET = True
+#Whether to delete chromosomes which contain a het region
+DELETE_HET = False	
+
+#Whether to extends region end points to the midpoint between genotyped sites or not
+EXTEND_ENDS = False
+
+DEFAULT_BINSIZE = 100
+
+chromeLengths = {"I" : 15072000, "II" : 15279000, "III" : 13784000, "IV" : 17494000, "V" : 20920000, "X" : 17719000}
 
 class Region:
 	prevPred = "-"
@@ -85,43 +93,16 @@ class Region:
 		self.link = "<a target=\"_blank\" href=\"http://gbrowse2014.biology.gatech.edu/jbrowse.html?data=conversion&loc=CHROMOSOME_{0}%3A{1}..{2}&tracks=DNA%2C{3}_calledReads.H%2C{3}_calledReads.M%2C{3}_calledReads.N%2C{3}_calledReads.U%2C{3}_pred_100\">View</a>".format(self.chrome, str(displayStart), str(displayEnd), self.strain)
 			
 	def toString(self):
-		if OLD_PRINT:
+		if TABLE_PRINT:
 			return '\t'.join((self.chrome, str(self.earlyEnd), str(self.lateEnd), self.pred, str(self.numSites), str(self.percentN), str(self.percentM), str(self.percentH), str(self.percentU)))
 		else:
 			return '\t'.join((self.strain, self.chrome, "{:,}".format(self.start), "{:,}".format(self.earlyEnd), "{:,}".format(self.size), "{:,}".format(self.numSites), "{:.2%}".format(self.percentN), "{:.2%}".format(self.percentM), "{:.2%}".format(self.percentH), "{:.2%}".format(self.percentI), "{:.2%}".format(self.percentU), self.prevPred, self.pred, self.nextPred, self.link))
 
-def cutoffs(binSize):
-	"""Figure out cutoffs for the given bin size.
-	Returns a tuple of cutoffs. Less than the first number
-	means the bin is most likely M, greater than the second
-	number means the bin is most likely N, in between is 
-	heterozygous"""
-	
-	binSize = int(binSize)	
-	#Binomial for number of Ns in bin
-	mProb = scipy.stats.binom.pmf(range(binSize+1),binSize,0.01)
-	hProb = scipy.stats.binom.pmf(range(binSize+1),binSize,0.5)
-	nProb = scipy.stats.binom.pmf(range(binSize+1),binSize,0.99)
-	
-	mThresh = -1
-	nThresh = binSize+1
-
-	for i in range(binSize+1):
-		if(hProb[i] > mProb[i]):
-			mThresh = i
-			break
-
-	for i in range(binSize, 0, -1):
-		if(hProb[i] > nProb[i]):
-			nThresh = i
-			break;
-
-	return float(mThresh), float(nThresh)
-
 def predict(inFileName, outFileName, strain, binSize):
 	"""Walks through a file of site calls and predicts
 	Whether the region is M, N, or H based on a sliding
-	window of the given binSize"""
+	window of the given binSize.
+	Returns a tuple with the number of chromosomes and regions predicted"""
 
 	with open(inFileName) as sitesFile, open(outFileName, 'w') as predFile:
 		#Load whole file into memory since it is only a couple of MBs
@@ -141,25 +122,34 @@ def predict(inFileName, outFileName, strain, binSize):
 				uCount = 0
 
 		#Write header
-		if OLD_PRINT:
-			predFile.write('\t'.join(("Chromosome", "Breakpoint Lower", "Breakpoint Upper", "Prediction", "Number of SNPs", "N2/Genotyped", "MY14/Genotyped", "Heterozygous/Genotyped", "Unknown/All")) + '\n')
-
-		else:
+		if TABLE_PRINT:
 			predFile.write(','.join(("Strain", "Chromosome", "Start", "End", "Size (kbp)", "Number of SNPs", "N2/Genotyped", "MY14/Genotyped", "Heterozygous/Genotyped", "Incongruities/Genotyped", "Unknown/All", "Previous Prediction", "Prediction", "Next Prediction", "Link")) + '\n')
-
+		else:
+			predFile.write('\t'.join(("Chromosome", "Breakpoint Lower", "Breakpoint Upper", "Prediction", "Number of SNPs", "N2/Genotyped", "MY14/Genotyped", "Heterozygous/Genotyped", "Unknown/All")) + '\n')
+			
 		#Gather up thresholds for the binSize and binSize/2 because sometimes
 		#we break the window in half for more positional knowledge
-		binSize = int(binSize)
-		fullBinThresh = cutoffs(binSize)
-		halfBinThresh = cutoffs(binSize / 2)
+		fullBinThresh = util.cutoffs(binSize)
+		halfBinThresh = util.cutoffs(binSize / 2)
 		thresholds = (fullBinThresh[0], fullBinThresh[1], halfBinThresh[0], halfBinThresh[1])
 
-		#Make predictions for each chromesome
+		#The total number of chromosomes and regions predicted
+		chromeCount = 0
+		regCount = 0
+
+		#Make predictions for each chromosome
 		for chrome in sorted(chromeMap.keys()):
-			predictChrome(strain, chrome, chromeMap[chrome], binSize, thresholds, predFile)
+			chromes, regs = predictChrome(strain, chrome, chromeMap[chrome], binSize, thresholds, predFile)
+			chromeCount += chromes
+			regCount += regs
+			
+		return chromeCount, regCount
 
 def predictChrome(strain, chrome, sites, binSize, thresholds, predFile):
-	"""Walks through the sites and makes predictions"""
+	"""Walks through the sites and makes predictions, printing them out to predFile.
+	Also returns a tuple with:
+	 0 or 1 in the first position for whether this chromosome was included in our predictions
+	 the number of regions predicted on this chromosome"""
 
 	currPred = None
 	currStart = 0
@@ -181,7 +171,7 @@ def predictChrome(strain, chrome, sites, binSize, thresholds, predFile):
 
 		newPred, halfCall = call(window, thresholds, currPred)
 		
-		if(NO_HET and newPred == 'H'):
+		if(DELETE_HET and newPred == 'H'):
 			foundHet = True
 			break
 
@@ -197,7 +187,7 @@ def predictChrome(strain, chrome, sites, binSize, thresholds, predFile):
 
 			currStart = currStart + cut
 
-			currRegion = Region(strain, chrome, prevRegion, getStart(lastCut, sites), sites[currStart - 1][1], sites[currStart][1], currPred, sites[lastCut:currStart - 1])
+			currRegion = Region(strain, chrome, prevRegion, getStart(lastCut, sites), getEarlyEnd(currStart, sites), getLateEnd(currStart, sites), currPred, sites[lastCut:currStart - 1])
 			regions.append(currRegion)
 
 			lastCut = currStart
@@ -205,33 +195,49 @@ def predictChrome(strain, chrome, sites, binSize, thresholds, predFile):
 
 		currPred = newPred
 
-		#Not considering overlapping windows, not sure if that's the right thing to do or not
-		#sometimes we only call half of the window length, in which case only
-		#advance half a window size
-		
-		#Well let's just always say half a window size to be consistent. -djc 5/22/14
-		#if(halfCall):
-		currEnd = currEnd - binSize / 2
+		#Advance the minimum of spaces that are guaranteed to be the same as the call - thresholds[3]
+		nextSearchStart = max(currStart + int(math.ceil(thresholds[3])), lastCut)
 
-		currStart = findNextDiff(sites, currEnd+1, currPred)
+		currStart = findNextDiff(sites, nextSearchStart, currPred)
 		currEnd = currStart + binSize
 
-	if(NO_HET and foundHet):
+	if(DELETE_HET and foundHet):
 		print "Heterozygous region on {} chromosome {}, ignoring entire chromosome.".format(strain, chrome)
+		return 0, 0
 	else:
 		#Now we are at the end, add the last prediction
-		regions.append(Region(strain, chrome, prevRegion, getStart(lastCut, sites), sites[-1][1], sites[-1][1], currPred, sites[lastCut:currStart - 1]))
+		regions.append(Region(strain, chrome, prevRegion, getStart(lastCut, sites), chromeLengths[chrome], chromeLengths[chrome], currPred, sites[lastCut:currStart - 1]))
 		
 		for region in regions:
 			predFile.write(region.toString() + '\n')
+			
+		return 1, len(regions)
 	
+	
+def midpoint(position, sites):
+	return (sites[position - 1][1] + sites[position][1]) / 2
 
-def getStart(lastCut, sites):
+def getStart(start, sites):
 	"""Gets the start of a region based on the last cutting point"""
-	if(lastCut == 0):
+	if(start == 0):
 		return 0
 	else:
-		return sites[lastCut][1]
+		if EXTEND_ENDS:
+			return midpoint(start, sites)
+		else:
+			return sites[start][1]
+		
+def getEarlyEnd(end, sites):
+	if EXTEND_ENDS:
+		return midpoint(end, sites)
+	else:
+		return sites[end - 1][1]
+	
+def getLateEnd(end, sites):
+	if EXTEND_ENDS:
+		return midpoint(end, sites)
+	else:
+		return sites[end][1]
 
 def findNextDiff(sites, index, curr):
 	"""Returns the index of the next site that is different from the given
@@ -300,7 +306,7 @@ def callWindow(window, mThresh, nThresh):
 
 def callHetero(window, thresholds, currPred):
 	"""We were finding that het calls were too liberal in the case
-	that the first half was N, and the seocnd half was M (or vice versa).
+	that the first half was N, and the second half was M (or vice versa).
 	So now divide a het window in half and proceed based on the content of
 	each half."""
 
@@ -329,7 +335,24 @@ def callHetero(window, thresholds, currPred):
 		#Then take the call, but only for this first part
 		return firstCall, True
 
-if __name__ == '__main__':
-	#cutoffs(*sys.argv[1:])
-	predict(*sys.argv[1:])
+if __name__ == '__main__':	
+	parser = argparse.ArgumentParser()
+	parser.add_argument("strain", help="the strain found in callsFile")
+	parser.add_argument("callsFile", help="the file with site calls")
+	parser.add_argument("outputFile", help="the file to save predictions to")
+	parser.add_argument("-d",  action="store_true", help="delete heterozygous chromosomes")
+	parser.add_argument("-e",  action="store_true", help="extend regions to touch each other")
+	parser.add_argument("-t",  action="store_true", help="print in the format needed for making the table, as opposed to the gffs")
+	parser.add_argument("-b",  "--binSize", type=int, help="bin size for predictions")
+	args = parser.parse_args()
+	
+	DELETE_HET = args.d
+	EXTEND_ENDS = args.e
+	TABLE_PRINT = args.t
+	
+	binSize = DEFAULT_BINSIZE
+	if args.binSize:
+		binSize = args.binSize
+	
+	predict(args.callsFile, args.outputFile, args.strain, binSize)
 	
